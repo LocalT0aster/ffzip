@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
 """Reencode a video to 720p (smallest side) with Telegram-friendly settings."""
 
 from __future__ import annotations
