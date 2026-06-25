@@ -11,9 +11,15 @@ import argparse
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+
+DEFAULT_VIDEO_BITRATE: Final[str] = "2000k"
+BITRATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<value>(?:\d+(?:\.\d*)?|\.\d+))(?P<suffix>[kKmM]?)$"
+)
 
 FFPROBE_CMD: Final[list[str]] = [
     "ffprobe",
@@ -26,6 +32,114 @@ FFPROBE_CMD: Final[list[str]] = [
     "-of",
     "csv=p=0",
 ]
+
+
+@dataclass(frozen=True)
+class Bitrate:
+    """Validated ffmpeg bitrate value."""
+
+    value: str
+    bits_per_second: int
+
+
+@dataclass(frozen=True)
+class VideoSettings:
+    """x264 quality settings."""
+
+    bitrate: Bitrate | None
+    crf: int | None
+
+
+def _parse_bitrate(value: str) -> Bitrate:
+    """Parse positive ffmpeg-style bitrate values.
+
+    Parameters
+    ----------
+    value
+        Bitrate string such as ``1500k`` or ``2M``.
+
+    Returns
+    -------
+    Bitrate
+        Original value plus parsed bits per second.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the bitrate is not positive or cannot be parsed.
+    """
+
+    match = BITRATE_RE.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "expected a positive ffmpeg-style bitrate, e.g. 1500k or 2M"
+        )
+
+    number = float(match.group("value"))
+    suffix = match.group("suffix").lower()
+    multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[suffix]
+    bits_per_second = round(number * multiplier)
+    if bits_per_second < 1:
+        raise argparse.ArgumentTypeError("bitrate must be greater than zero")
+
+    return Bitrate(value=value, bits_per_second=bits_per_second)
+
+
+def _parse_crf(value: str) -> int:
+    """Parse x264 CRF values.
+
+    Parameters
+    ----------
+    value
+        CRF value in the libx264 range.
+
+    Returns
+    -------
+    int
+        Parsed CRF value.
+
+    Raises
+    ------
+    argparse.ArgumentTypeError
+        If the CRF value is outside the libx264 range.
+    """
+
+    try:
+        crf = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("CRF must be an integer from 0 to 51") from exc
+
+    if not 0 <= crf <= 51:
+        raise argparse.ArgumentTypeError("CRF must be an integer from 0 to 51")
+
+    return crf
+
+
+def _format_bitrate(bits_per_second: int) -> str:
+    """Format a parsed bitrate for ffmpeg."""
+
+    if bits_per_second % 1_000 == 0:
+        return f"{bits_per_second // 1_000}k"
+    return str(bits_per_second)
+
+
+def _video_quality_args(settings: VideoSettings) -> list[str]:
+    """Build ffmpeg video quality arguments."""
+
+    if settings.crf is not None:
+        return ["-crf", str(settings.crf)]
+
+    bitrate = settings.bitrate or _parse_bitrate(DEFAULT_VIDEO_BITRATE)
+    maxrate = round(bitrate.bits_per_second * 1.05)
+    bufsize = bitrate.bits_per_second * 2
+    return [
+        "-b:v",
+        bitrate.value,
+        "-maxrate",
+        _format_bitrate(maxrate),
+        "-bufsize",
+        _format_bitrate(bufsize),
+    ]
 
 
 def _run_capture(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -119,7 +233,12 @@ def _output_path(input_path: Path, output: str | None) -> Path:
     return input_path.with_name(f"{input_path.stem}_tg720.mp4")
 
 
-def _run_ffmpeg(input_path: Path, output_path: Path, scale_filter: str) -> int:
+def _run_ffmpeg(
+    input_path: Path,
+    output_path: Path,
+    scale_filter: str,
+    settings: VideoSettings,
+) -> int:
     cmd = [
         "ffmpeg",
         "-i",
@@ -132,12 +251,7 @@ def _run_ffmpeg(input_path: Path, output_path: Path, scale_filter: str) -> int:
         "baseline",
         "-level",
         "3.1",
-        "-b:v",
-        "2000k",
-        "-maxrate",
-        "2100k",
-        "-bufsize",
-        "4000k",
+        *_video_quality_args(settings),
         "-c:a",
         "aac",
         "-b:a",
@@ -163,6 +277,29 @@ def _build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help="Output file path (default: <input>_tg720.mp4)",
     )
+    quality_group = parser.add_mutually_exclusive_group()
+    quality_group.add_argument(
+        "-b",
+        "--video-bitrate",
+        type=_parse_bitrate,
+        default=_parse_bitrate(DEFAULT_VIDEO_BITRATE),
+        metavar="BITRATE",
+        help=(
+            "Target video bitrate for bitrate mode "
+            f"(default: {DEFAULT_VIDEO_BITRATE}; examples: 1500k, 2M). "
+            "Mutually exclusive with --crf."
+        ),
+    )
+    quality_group.add_argument(
+        "--crf",
+        type=_parse_crf,
+        metavar="CRF",
+        help=(
+            "Use x264 CRF quality mode instead of bitrate mode. "
+            "Range: 0-51; lower means higher quality and larger files; "
+            "common values: 18-28. Mutually exclusive with --video-bitrate."
+        ),
+    )
     return parser
 
 
@@ -183,9 +320,13 @@ def main(argv: list[str]) -> int:
 
     scale_filter = _scale_filter(width, height)
     output_path = _output_path(input_path, args.output)
+    video_settings = VideoSettings(
+        bitrate=args.video_bitrate if args.crf is None else None,
+        crf=args.crf,
+    )
 
     try:
-        return _run_ffmpeg(input_path, output_path, scale_filter)
+        return _run_ffmpeg(input_path, output_path, scale_filter, video_settings)
     except FileNotFoundError as exc:
         print(f"ffmpeg not found: {exc}", file=sys.stderr)
         return 1
