@@ -1,0 +1,212 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.14"
+# dependencies = []
+# ///
+"""Print a compact ffprobe summary."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Final
+
+
+FFPROBE_CMD: Final[list[str]] = [
+    "ffprobe",
+    "-v",
+    "error",
+    "-show_format",
+    "-show_streams",
+    "-of",
+    "json",
+]
+
+
+def _format_duration(value: object) -> str | None:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if seconds < 0:
+        return None
+
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3_600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def _format_size(value: object) -> str | None:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if size < 0:
+        return None
+
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    amount = float(size)
+    for unit in units[:-1]:
+        if amount < 1_024:
+            return f"{amount:.1f}".rstrip("0").rstrip(".") + f" {unit}"
+        amount /= 1_024
+    return f"{amount:.1f}".rstrip("0").rstrip(".") + " TiB"
+
+
+def _format_bitrate(value: object) -> str | None:
+    try:
+        bitrate = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    if bitrate < 1:
+        return None
+
+    if bitrate < 1_000_000:
+        return f"{bitrate / 1_000:.1f}".rstrip("0").rstrip(".") + " kb/s"
+    return f"{bitrate / 1_000_000:.1f}".rstrip("0").rstrip(".") + " Mb/s"
+
+
+def _format_frame_rate(value: object) -> str | None:
+    if not isinstance(value, str) or "/" not in value:
+        return None
+
+    numerator, denominator = value.split("/", maxsplit=1)
+    try:
+        rate = int(numerator) / int(denominator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+    if rate <= 0:
+        return None
+    return f"{rate:.3f}".rstrip("0").rstrip(".") + " fps"
+
+
+def _tags(stream: dict[str, Any]) -> list[str]:
+    tags = stream.get("tags")
+    if not isinstance(tags, dict):
+        return []
+
+    language = tags.get("language")
+    return [language] if isinstance(language, str) and language else []
+
+
+def _disposition(stream: dict[str, Any]) -> list[str]:
+    disposition = stream.get("disposition")
+    if not isinstance(disposition, dict) or disposition.get("default") != 1:
+        return []
+    return ["default"]
+
+
+def _stream_line(stream: dict[str, Any]) -> str:
+    index = stream.get("index", "?")
+    stream_type = stream.get("codec_type", "unknown")
+    fields = [f"#{index}", str(stream_type)]
+
+    codec = stream.get("codec_name")
+    profile = stream.get("profile")
+    if isinstance(codec, str) and codec:
+        fields.append(" ".join(str(part) for part in (codec, profile) if part))
+
+    if stream_type == "video":
+        width, height = stream.get("width"), stream.get("height")
+        if isinstance(width, int) and isinstance(height, int):
+            fields.append(f"{width}x{height}")
+        frame_rate = _format_frame_rate(stream.get("avg_frame_rate"))
+        if frame_rate:
+            fields.append(frame_rate)
+    elif stream_type == "audio":
+        channels = stream.get("channels")
+        if channels == 1:
+            fields.append("mono")
+        elif channels == 2:
+            fields.append("stereo")
+        elif isinstance(channels, int) and channels > 0:
+            fields.append(f"{channels} ch")
+
+        try:
+            sample_rate = int(stream.get("sample_rate"))
+        except (TypeError, ValueError):
+            sample_rate = 0
+        if sample_rate > 0:
+            fields.append(f"{sample_rate / 1_000:g} kHz")
+
+    bitrate = _format_bitrate(stream.get("bit_rate"))
+    if bitrate:
+        fields.append(bitrate)
+    fields.extend(_tags(stream))
+    fields.extend(_disposition(stream))
+    return " | ".join(fields)
+
+
+def _render(path: Path, probe: dict[str, Any]) -> str:
+    format_data = probe.get("format")
+    if not isinstance(format_data, dict):
+        format_data = {}
+
+    summary = [path.name]
+    for value in (
+        _format_duration(format_data.get("duration")),
+        _format_size(format_data.get("size")),
+        _format_bitrate(format_data.get("bit_rate")),
+    ):
+        if value:
+            summary.append(value)
+
+    lines = [" | ".join(summary)]
+    streams = probe.get("streams")
+    if isinstance(streams, list):
+        lines.extend(_stream_line(stream) for stream in streams if isinstance(stream, dict))
+    return "\n".join(lines)
+
+
+def _probe(path: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        [*FFPROBE_CMD, str(path)], check=False, text=True, capture_output=True
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed")
+
+    try:
+        probe = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("ffprobe returned invalid JSON") from exc
+
+    if not isinstance(probe, dict):
+        raise RuntimeError("ffprobe returned an invalid report")
+    return probe
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Print a compact ffprobe stream summary.")
+    parser.add_argument("input", help="Input media file path")
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    args = _build_parser().parse_args(argv)
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Input file not found: {input_path}", file=sys.stderr)
+        return 1
+
+    try:
+        print(_render(input_path, _probe(input_path)))
+    except (OSError, RuntimeError) as exc:
+        print(f"Probe failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
