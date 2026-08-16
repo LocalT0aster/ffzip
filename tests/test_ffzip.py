@@ -63,6 +63,18 @@ class OutputPathTests(unittest.TestCase):
             Path("movie_h264_720p_C43.mp4"),
         )
 
+    def test_frame_rate_path_uses_a_filename_safe_suffix(self) -> None:
+        bitrate = ffzip._parse_bitrate("1M")
+        self.assertEqual(
+            ffzip._output_path(
+                Path("movie.mkv"),
+                None,
+                480,
+                ffzip.VideoSettings(bitrate=bitrate, crf=None, frame_rate="30000/1001"),
+            ),
+            Path("movie_h264_480p_30000-1001fps_1M.mp4"),
+        )
+
     def test_explicit_output_path_is_unchanged(self) -> None:
         self.assertEqual(
             ffzip._output_path(
@@ -123,6 +135,37 @@ class MinSideTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     ffzip._parse_min_side(value)
+
+
+class FrameRateTests(unittest.TestCase):
+    def test_accepts_decimal_and_rational_rates(self) -> None:
+        for value in ("24", "29.97", "30000/1001"):
+            with self.subTest(value=value):
+                self.assertEqual(ffzip._parse_frame_rate(value), value)
+
+    def test_rejects_invalid_or_non_positive_rates(self) -> None:
+        for value in ("0", "-24", "24/0", "ntsc", "24/1.001"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    ffzip._parse_frame_rate(value)
+
+    def test_passes_frame_rate_as_an_ffmpeg_output_option(self) -> None:
+        settings = ffzip.VideoSettings(bitrate=None, crf=None, frame_rate="30000/1001")
+        result = mock.Mock(returncode=0)
+        with mock.patch.object(ffzip.subprocess, "run", return_value=result) as run:
+            self.assertEqual(
+                ffzip._run_ffmpeg(
+                    Path("input.webm"),
+                    Path("output.mp4"),
+                    "scale=-2:720,setsar=1",
+                    settings,
+                ),
+                0,
+            )
+
+        command = run.call_args.args[0]
+        frame_rate_index = command.index("-r")
+        self.assertEqual(command[frame_rate_index : frame_rate_index + 2], ["-r", "30000/1001"])
 
 
 class QualityArgumentTests(unittest.TestCase):

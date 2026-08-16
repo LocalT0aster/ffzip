@@ -23,6 +23,9 @@ DEFAULT_CODEC_NAME: Final[str] = "h264"
 BITRATE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?P<value>(?:\d+(?:\.\d*)?|\.\d+))(?P<suffix>[kKmM]?)$"
 )
+FRAME_RATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<numerator>(?:\d+(?:\.\d*)?|\.\d+))(?:/(?P<denominator>\d+))?$"
+)
 
 FFPROBE_CMD: Final[list[str]] = [
     "ffprobe",
@@ -62,6 +65,7 @@ class VideoSettings:
 
     bitrate: Bitrate | None
     crf: int | None
+    frame_rate: str | None = None
 
 
 def _parse_bitrate(value: str) -> Bitrate:
@@ -141,6 +145,24 @@ def _parse_min_side(value: str) -> int:
         raise argparse.ArgumentTypeError("minimum side must be a positive integer")
 
     return min_side
+
+
+def _parse_frame_rate(value: str) -> str:
+    """Parse positive decimal or rational ffmpeg frame rates."""
+
+    match = FRAME_RATE_RE.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "frame rate must be a positive number or fraction, e.g. 24, 29.97, or 30000/1001"
+        )
+
+    numerator = float(match.group("numerator"))
+    denominator_text = match.group("denominator")
+    denominator = int(denominator_text) if denominator_text else 1
+    if numerator <= 0 or denominator < 1:
+        raise argparse.ArgumentTypeError("frame rate must be greater than zero")
+
+    return value
 
 
 def _format_bitrate(bits_per_second: int) -> str:
@@ -293,6 +315,8 @@ def _output_path(
         return Path(output)
 
     suffix = f"_{DEFAULT_CODEC_NAME}_{min_side}p"
+    if settings.frame_rate is not None:
+        suffix += f"_{settings.frame_rate.replace('/', '-')}fps"
     if settings.crf is not None:
         suffix += f"_C{settings.crf}"
     elif settings.bitrate is not None:
@@ -306,12 +330,14 @@ def _run_ffmpeg(
     scale_filter: str,
     settings: VideoSettings,
 ) -> int:
+    frame_rate_args = ["-r", settings.frame_rate] if settings.frame_rate else []
     cmd = [
         "ffmpeg",
         "-i",
         str(input_path),
         "-vf",
         scale_filter,
+        *frame_rate_args,
         "-c:v",
         DEFAULT_VIDEO_ENCODER,
         "-profile:v",
@@ -342,7 +368,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "output",
         nargs="?",
-        help="Output file path (default: <input>_h264_<min-side>p[_quality].mp4)",
+        help="Output file path (default: <input>_h264_<min-side>p[_fps][_quality].mp4)",
     )
     parser.add_argument(
         "-s",
@@ -354,6 +380,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "Maximum size of the shorter side; larger inputs are downscaled without "
             f"upscaling (default: {DEFAULT_MIN_SIDE})."
         ),
+    )
+    parser.add_argument(
+        "-r",
+        "--frame-rate",
+        type=_parse_frame_rate,
+        metavar="RATE",
+        help="Output frame rate, e.g. 24, 29.97, or 30000/1001.",
     )
     quality_group = parser.add_mutually_exclusive_group()
     quality_group.add_argument(
@@ -416,6 +449,7 @@ def main(argv: list[str]) -> int:
     video_settings = VideoSettings(
         bitrate=bitrate,
         crf=args.crf,
+        frame_rate=args.frame_rate,
     )
     scale_filter = _scale_filter(width, height, args.min_side)
     output_path = _output_path(input_path, args.output, args.min_side, video_settings)
