@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Reencode a video to 720p (smallest side) with Telegram-friendly settings."""
+"""Resize and reencode videos with compact, shareable defaults."""
 
 from __future__ import annotations
 
@@ -17,6 +17,9 @@ from typing import Final
 
 
 DEFAULT_VIDEO_BITRATE: Final[str] = "2000k"
+DEFAULT_MIN_SIDE: Final[int] = 720
+DEFAULT_VIDEO_ENCODER: Final[str] = "libx264"
+DEFAULT_CODEC_NAME: Final[str] = "h264"
 BITRATE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?P<value>(?:\d+(?:\.\d*)?|\.\d+))(?P<suffix>[kKmM]?)$"
 )
@@ -115,6 +118,20 @@ def _parse_crf(value: str) -> int:
     return crf
 
 
+def _parse_min_side(value: str) -> int:
+    """Parse a positive target size for the video's shorter side."""
+
+    try:
+        min_side = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("minimum side must be a positive integer") from exc
+
+    if min_side < 1:
+        raise argparse.ArgumentTypeError("minimum side must be a positive integer")
+
+    return min_side
+
+
 def _format_bitrate(bits_per_second: int) -> str:
     """Format a parsed bitrate for ffmpeg."""
 
@@ -202,7 +219,7 @@ def _probe_resolution(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _scale_filter(width: int, height: int) -> str:
+def _scale_filter(width: int, height: int, min_side: int) -> str:
     """Compute the scale filter for the target size.
 
     Parameters
@@ -218,19 +235,30 @@ def _scale_filter(width: int, height: int) -> str:
         ffmpeg scale filter expression.
     """
 
-    min_side = min(width, height)
-    if min_side > 720:
+    source_min_side = min(width, height)
+    if source_min_side > min_side:
         if width < height:
-            return "scale=720:-2:flags=lanczos,setsar=1"
-        return "scale=-2:720:flags=lanczos,setsar=1"
+            return f"scale={min_side}:-2:flags=lanczos,setsar=1"
+        return f"scale=-2:{min_side}:flags=lanczos,setsar=1"
 
     return f"scale={width}:{height},setsar=1"
 
 
-def _output_path(input_path: Path, output: str | None) -> Path:
+def _output_path(
+    input_path: Path,
+    output: str | None,
+    min_side: int,
+    settings: VideoSettings,
+) -> Path:
     if output:
         return Path(output)
-    return input_path.with_name(f"{input_path.stem}_tg720.mp4")
+
+    suffix = f"_{DEFAULT_CODEC_NAME}_{min_side}p"
+    if settings.crf is not None:
+        suffix += f"_C{settings.crf}"
+    elif settings.bitrate is not None:
+        suffix += f"_{settings.bitrate.value}"
+    return input_path.with_name(f"{input_path.stem}{suffix}.mp4")
 
 
 def _run_ffmpeg(
@@ -246,7 +274,7 @@ def _run_ffmpeg(
         "-vf",
         scale_filter,
         "-c:v",
-        "libx264",
+        DEFAULT_VIDEO_ENCODER,
         "-profile:v",
         "baseline",
         "-level",
@@ -268,21 +296,31 @@ def _run_ffmpeg(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Reencode a video to 720p on the smallest side with Telegram-friendly settings."
+            "Resize and reencode a video, capping its shorter side without upscaling."
         )
     )
     parser.add_argument("input", help="Input video file path")
     parser.add_argument(
         "output",
         nargs="?",
-        help="Output file path (default: <input>_tg720.mp4)",
+        help="Output file path (default: <input>_h264_<min-side>p[_quality].mp4)",
+    )
+    parser.add_argument(
+        "-s",
+        "--min-side",
+        type=_parse_min_side,
+        default=DEFAULT_MIN_SIDE,
+        metavar="PIXELS",
+        help=(
+            "Maximum size of the shorter side; larger inputs are downscaled without "
+            f"upscaling (default: {DEFAULT_MIN_SIDE})."
+        ),
     )
     quality_group = parser.add_mutually_exclusive_group()
     quality_group.add_argument(
         "-b",
         "--video-bitrate",
         type=_parse_bitrate,
-        default=_parse_bitrate(DEFAULT_VIDEO_BITRATE),
         metavar="BITRATE",
         help=(
             "Target video bitrate for bitrate mode "
@@ -318,12 +356,12 @@ def main(argv: list[str]) -> int:
         print(f"Resolution probe failed: {exc}", file=sys.stderr)
         return 1
 
-    scale_filter = _scale_filter(width, height)
-    output_path = _output_path(input_path, args.output)
     video_settings = VideoSettings(
-        bitrate=args.video_bitrate if args.crf is None else None,
+        bitrate=args.video_bitrate,
         crf=args.crf,
     )
+    scale_filter = _scale_filter(width, height, args.min_side)
+    output_path = _output_path(input_path, args.output, args.min_side, video_settings)
 
     try:
         return _run_ffmpeg(input_path, output_path, scale_filter, video_settings)
