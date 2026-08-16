@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import subprocess
 import sys
@@ -187,25 +188,50 @@ def _probe(path: Path) -> dict[str, Any]:
     return probe
 
 
+def _expand_inputs(inputs: list[str]) -> tuple[list[Path], list[str]]:
+    """Expand glob patterns while preserving input order."""
+
+    paths: list[Path] = []
+    errors: list[str] = []
+    for input_value in inputs:
+        if glob.has_magic(input_value):
+            matches = sorted(glob.glob(input_value, recursive=True))
+            if not matches:
+                errors.append(f"No matches for pattern: {input_value}")
+            paths.extend(Path(match) for match in matches)
+        else:
+            paths.append(Path(input_value))
+    return paths, errors
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Print a compact ffprobe stream summary.")
-    parser.add_argument("input", help="Input media file path")
+    parser.add_argument("inputs", nargs="+", help="Input media file paths or glob patterns")
     return parser
 
 
 def main(argv: list[str]) -> int:
     args = _build_parser().parse_args(argv)
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Input file not found: {input_path}", file=sys.stderr)
-        return 1
+    input_paths, errors = _expand_inputs(args.inputs)
+    for error in errors:
+        print(error, file=sys.stderr)
 
-    try:
-        print(_render(input_path, _probe(input_path)))
-    except (OSError, RuntimeError) as exc:
-        print(f"Probe failed: {exc}", file=sys.stderr)
-        return 1
-    return 0
+    reports: list[str] = []
+    for input_path in input_paths:
+        if not input_path.exists():
+            print(f"Input file not found: {input_path}", file=sys.stderr)
+            errors.append(str(input_path))
+            continue
+
+        try:
+            reports.append(_render(input_path, _probe(input_path)))
+        except (OSError, RuntimeError) as exc:
+            print(f"Probe failed for {input_path}: {exc}", file=sys.stderr)
+            errors.append(str(input_path))
+
+    if reports:
+        print("\n\n".join(reports))
+    return int(bool(errors))
 
 
 if __name__ == "__main__":

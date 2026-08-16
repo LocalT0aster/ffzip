@@ -2,7 +2,9 @@
 
 import importlib.machinery
 import importlib.util
+import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -98,6 +100,61 @@ class ProbeTests(unittest.TestCase):
                 with mock.patch.object(ffp.subprocess, "run", return_value=result):
                     with self.assertRaises(RuntimeError):
                         ffp._probe(Path("clip.webm"))
+
+
+class InputExpansionTests(unittest.TestCase):
+    def test_expands_and_sorts_glob_matches(self) -> None:
+        with mock.patch.object(ffp.glob, "glob", return_value=["b.mp4", "a.mp4"]) as expand:
+            paths, errors = ffp._expand_inputs(["*.mp4", "clip.webm"])
+
+        self.assertEqual(paths, [Path("a.mp4"), Path("b.mp4"), Path("clip.webm")])
+        self.assertEqual(errors, [])
+        expand.assert_called_once_with("*.mp4", recursive=True)
+
+    def test_reports_unmatched_glob(self) -> None:
+        with mock.patch.object(ffp.glob, "glob", return_value=[]):
+            paths, errors = ffp._expand_inputs(["**/*.mkv"])
+
+        self.assertEqual(paths, [])
+        self.assertEqual(errors, ["No matches for pattern: **/*.mkv"])
+
+
+class BatchTests(unittest.TestCase):
+    def test_prints_reports_with_blank_line_separators(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory, "first.mp4")
+            second = Path(directory, "second.mp4")
+            first.touch()
+            second.touch()
+            output = io.StringIO()
+            with (
+                mock.patch.object(ffp, "_probe", return_value={}),
+                mock.patch.object(ffp, "_render", side_effect=["first report", "second report"]),
+                mock.patch("sys.stdout", output),
+            ):
+                result = ffp.main([str(first), str(second)])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "first report\n\nsecond report\n")
+
+    def test_continues_after_missing_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            existing = Path(directory, "existing.mp4")
+            missing = Path(directory, "missing.mp4")
+            existing.touch()
+            output = io.StringIO()
+            errors = io.StringIO()
+            with (
+                mock.patch.object(ffp, "_probe", return_value={}),
+                mock.patch.object(ffp, "_render", return_value="existing report"),
+                mock.patch("sys.stdout", output),
+                mock.patch("sys.stderr", errors),
+            ):
+                result = ffp.main([str(existing), str(missing)])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "existing report\n")
+        self.assertIn("Input file not found", errors.getvalue())
 
 
 if __name__ == "__main__":
