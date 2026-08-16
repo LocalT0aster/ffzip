@@ -35,6 +35,17 @@ FFPROBE_CMD: Final[list[str]] = [
     "-of",
     "csv=p=0",
 ]
+FFPROBE_VIDEO_BITRATE_CMD: Final[list[str]] = [
+    "ffprobe",
+    "-v",
+    "error",
+    "-select_streams",
+    "v:0",
+    "-show_entries",
+    "stream=bit_rate",
+    "-of",
+    "csv=p=0",
+]
 
 
 @dataclass(frozen=True)
@@ -219,6 +230,34 @@ def _probe_resolution(path: Path) -> tuple[int, int]:
     return width, height
 
 
+def _probe_video_bitrate(path: Path) -> Bitrate:
+    """Get the declared bitrate for the first video stream.
+
+    Raises
+    ------
+    RuntimeError
+        If ffprobe fails or the stream does not declare a positive bitrate.
+    """
+
+    result = _run_capture([*FFPROBE_VIDEO_BITRATE_CMD, str(path)])
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffprobe failed")
+
+    text = result.stdout.strip()
+    try:
+        bits_per_second = int(text)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid video bitrate: {text!r}") from exc
+
+    if bits_per_second < 1:
+        raise RuntimeError("could not read video bitrate")
+
+    return Bitrate(
+        value=_format_bitrate(bits_per_second),
+        bits_per_second=bits_per_second,
+    )
+
+
 def _scale_filter(width: int, height: int, min_side: int) -> str:
     """Compute the scale filter for the target size.
 
@@ -338,6 +377,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "common values: 18-28. Mutually exclusive with --video-bitrate."
         ),
     )
+    quality_group.add_argument(
+        "-k",
+        "--keep-bitrate",
+        action="store_true",
+        help=(
+            "Use the input video stream's declared bitrate. Mutually exclusive with "
+            "--video-bitrate and --crf."
+        ),
+    )
     return parser
 
 
@@ -356,8 +404,17 @@ def main(argv: list[str]) -> int:
         print(f"Resolution probe failed: {exc}", file=sys.stderr)
         return 1
 
+    if args.keep_bitrate:
+        try:
+            bitrate = _probe_video_bitrate(input_path)
+        except (RuntimeError, OSError) as exc:
+            print(f"Video bitrate probe failed: {exc}", file=sys.stderr)
+            return 1
+    else:
+        bitrate = args.video_bitrate
+
     video_settings = VideoSettings(
-        bitrate=args.video_bitrate,
+        bitrate=bitrate,
         crf=args.crf,
     )
     scale_filter = _scale_filter(width, height, args.min_side)

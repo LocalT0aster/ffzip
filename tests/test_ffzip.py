@@ -1,11 +1,14 @@
 """Unit tests for the ffzip CLI helpers."""
 
 import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "ffzip"
@@ -78,6 +81,39 @@ class OutputPathTests(unittest.TestCase):
         )
 
 
+class VideoBitrateProbeTests(unittest.TestCase):
+    def test_probes_first_video_stream_bitrate(self) -> None:
+        result = ffzip.subprocess.CompletedProcess([], 0, "1000000\n", "")
+        with mock.patch.object(ffzip, "_run_capture", return_value=result) as run_capture:
+            bitrate = ffzip._probe_video_bitrate(Path("movie.webm"))
+
+        self.assertEqual(bitrate, ffzip.Bitrate(value="1000k", bits_per_second=1_000_000))
+        run_capture.assert_called_once_with(
+            [*ffzip.FFPROBE_VIDEO_BITRATE_CMD, "movie.webm"]
+        )
+
+    def test_rejects_missing_or_invalid_bitrate(self) -> None:
+        for stdout in ("", "N/A\n", "0\n", "-1\n"):
+            with self.subTest(stdout=stdout):
+                result = ffzip.subprocess.CompletedProcess([], 0, stdout, "")
+                with mock.patch.object(ffzip, "_run_capture", return_value=result):
+                    with self.assertRaises(RuntimeError):
+                        ffzip._probe_video_bitrate(Path("movie.webm"))
+
+    def test_reports_ffprobe_failure(self) -> None:
+        result = ffzip.subprocess.CompletedProcess([], 1, "", "unsupported input")
+        with mock.patch.object(ffzip, "_run_capture", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "unsupported input"):
+                ffzip._probe_video_bitrate(Path("movie.webm"))
+
+    def test_inferred_bitrate_uses_bitrate_mode(self) -> None:
+        bitrate = ffzip.Bitrate(value="436k", bits_per_second=436_000)
+        self.assertEqual(
+            ffzip._video_quality_args(ffzip.VideoSettings(bitrate=bitrate, crf=None)),
+            ["-b:v", "436k", "-maxrate", "457800", "-bufsize", "872k"],
+        )
+
+
 class MinSideTests(unittest.TestCase):
     def test_accepts_positive_integer(self) -> None:
         self.assertEqual(ffzip._parse_min_side("480"), 480)
@@ -87,6 +123,19 @@ class MinSideTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     ffzip._parse_min_side(value)
+
+
+class QualityArgumentTests(unittest.TestCase):
+    def test_keep_bitrate_is_mutually_exclusive_with_other_quality_modes(self) -> None:
+        parser = ffzip._build_parser()
+        for arguments in (
+            ["movie.webm", "-k", "-b", "1M"],
+            ["movie.webm", "-k", "--crf", "23"],
+        ):
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit):
+                        parser.parse_args(arguments)
 
 
 if __name__ == "__main__":
