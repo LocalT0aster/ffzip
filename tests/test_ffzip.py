@@ -6,6 +6,7 @@ import importlib.machinery
 import importlib.util
 import io
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -179,6 +180,74 @@ class QualityArgumentTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         parser.parse_args(arguments)
+
+
+class BatchTests(unittest.TestCase):
+    def test_expands_and_sorts_glob_matches(self) -> None:
+        with mock.patch.object(ffzip.glob, "glob", return_value=["b.webm", "a.webm"]) as expand:
+            paths, errors = ffzip._expand_inputs(["*.webm", "clip.mp4"])
+
+        self.assertEqual(paths, [Path("a.webm"), Path("b.webm"), Path("clip.mp4")])
+        self.assertEqual(errors, [])
+        expand.assert_called_once_with("*.webm", recursive=True)
+
+    def test_converts_each_input_to_its_own_default_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory, "first.webm")
+            second = Path(directory, "second.webm")
+            first.touch()
+            second.touch()
+            with (
+                mock.patch.object(ffzip, "_probe_resolution", return_value=(1920, 1080)),
+                mock.patch.object(ffzip, "_run_ffmpeg", return_value=0) as run_ffmpeg,
+            ):
+                self.assertEqual(ffzip.main([str(first), str(second)]), 0)
+
+        self.assertEqual(run_ffmpeg.call_count, 2)
+        self.assertEqual(run_ffmpeg.call_args_list[0].args[1], first.with_name("first_h264_720p.mp4"))
+        self.assertEqual(run_ffmpeg.call_args_list[1].args[1], second.with_name("second_h264_720p.mp4"))
+
+    def test_continues_after_a_per_file_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory, "first.webm")
+            second = Path(directory, "second.webm")
+            first.touch()
+            second.touch()
+            with (
+                mock.patch.object(
+                    ffzip,
+                    "_probe_resolution",
+                    side_effect=[RuntimeError("invalid video"), (1920, 1080)],
+                ),
+                mock.patch.object(ffzip, "_run_ffmpeg", return_value=0) as run_ffmpeg,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(ffzip.main([str(first), str(second)]), 1)
+
+        run_ffmpeg.assert_called_once()
+
+    def test_output_option_applies_to_one_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory, "source.webm")
+            destination = Path(directory, "custom.mp4")
+            source.touch()
+            with (
+                mock.patch.object(ffzip, "_probe_resolution", return_value=(1920, 1080)),
+                mock.patch.object(ffzip, "_run_ffmpeg", return_value=0) as run_ffmpeg,
+            ):
+                self.assertEqual(ffzip.main([str(source), "-o", str(destination)]), 0)
+
+        self.assertEqual(run_ffmpeg.call_args.args[1], destination)
+
+    def test_rejects_output_option_for_multiple_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory, "first.webm")
+            second = Path(directory, "second.webm")
+            first.touch()
+            second.touch()
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    ffzip.main([str(first), str(second), "-o", "custom.mp4"])
 
 
 if __name__ == "__main__":

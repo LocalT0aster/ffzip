@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import re
 import subprocess
 import sys
@@ -324,6 +325,22 @@ def _output_path(
     return input_path.with_name(f"{input_path.stem}{suffix}.mp4")
 
 
+def _expand_inputs(inputs: list[str]) -> tuple[list[Path], list[str]]:
+    """Expand glob patterns while preserving input order."""
+
+    paths: list[Path] = []
+    errors: list[str] = []
+    for input_value in inputs:
+        if glob.has_magic(input_value):
+            matches = sorted(glob.glob(input_value, recursive=True))
+            if not matches:
+                errors.append(f"No matches for pattern: {input_value}")
+            paths.extend(Path(match) for match in matches)
+        else:
+            paths.append(Path(input_value))
+    return paths, errors
+
+
 def _run_ffmpeg(
     input_path: Path,
     output_path: Path,
@@ -364,11 +381,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "Resize and reencode a video, capping its shorter side without upscaling."
         )
     )
-    parser.add_argument("input", help="Input video file path")
     parser.add_argument(
-        "output",
-        nargs="?",
-        help="Output file path (default: <input>_h264_<min-side>p[_fps][_quality].mp4)",
+        "inputs",
+        nargs="+",
+        help="Input video file paths or glob patterns",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output file path; requires exactly one input file",
     )
     parser.add_argument(
         "-s",
@@ -426,39 +447,52 @@ def main(argv: list[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Input file not found: {input_path}", file=sys.stderr)
-        return 1
+    input_paths, errors = _expand_inputs(args.inputs)
+    if args.output and len(input_paths) != 1:
+        parser.error("--output requires exactly one input file")
 
-    try:
-        width, height = _probe_resolution(input_path)
-    except (RuntimeError, OSError) as exc:
-        print(f"Resolution probe failed: {exc}", file=sys.stderr)
-        return 1
+    for error in errors:
+        print(error, file=sys.stderr)
 
-    if args.keep_bitrate:
+    exit_code = int(bool(errors))
+    for input_path in input_paths:
+        if not input_path.exists():
+            print(f"Input file not found: {input_path}", file=sys.stderr)
+            exit_code = 1
+            continue
+
         try:
-            bitrate = _probe_video_bitrate(input_path)
+            width, height = _probe_resolution(input_path)
         except (RuntimeError, OSError) as exc:
-            print(f"Video bitrate probe failed: {exc}", file=sys.stderr)
+            print(f"Resolution probe failed for {input_path}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        if args.keep_bitrate:
+            try:
+                bitrate = _probe_video_bitrate(input_path)
+            except (RuntimeError, OSError) as exc:
+                print(f"Video bitrate probe failed for {input_path}: {exc}", file=sys.stderr)
+                exit_code = 1
+                continue
+        else:
+            bitrate = args.video_bitrate
+
+        video_settings = VideoSettings(
+            bitrate=bitrate,
+            crf=args.crf,
+            frame_rate=args.frame_rate,
+        )
+        scale_filter = _scale_filter(width, height, args.min_side)
+        output_path = _output_path(input_path, args.output, args.min_side, video_settings)
+
+        try:
+            exit_code = _run_ffmpeg(input_path, output_path, scale_filter, video_settings) or exit_code
+        except FileNotFoundError as exc:
+            print(f"ffmpeg not found: {exc}", file=sys.stderr)
             return 1
-    else:
-        bitrate = args.video_bitrate
 
-    video_settings = VideoSettings(
-        bitrate=bitrate,
-        crf=args.crf,
-        frame_rate=args.frame_rate,
-    )
-    scale_filter = _scale_filter(width, height, args.min_side)
-    output_path = _output_path(input_path, args.output, args.min_side, video_settings)
-
-    try:
-        return _run_ffmpeg(input_path, output_path, scale_filter, video_settings)
-    except FileNotFoundError as exc:
-        print(f"ffmpeg not found: {exc}", file=sys.stderr)
-        return 1
+    return exit_code
 
 
 if __name__ == "__main__":
